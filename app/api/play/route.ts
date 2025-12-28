@@ -7,8 +7,6 @@ function edgegapHeaders() {
   };
 }
 
-let cachedRequestId: string | null = null;
-
 function getState(st: any) {
   return (
     st?.current_status ||
@@ -45,6 +43,36 @@ function extractConn(st: any) {
   return { host: String(fqdn), port: Number(external) };
 }
 
+// Try to find an existing active deployment by tag.
+// This avoids Edgegap free-plan "only 1 active deployment" errors.
+async function findExistingDeploymentRequestId(tag: string): Promise<string | null> {
+  // Edgegap v2 deployments list endpoint.
+  // If Edgegap changes schema, we fall back gracefully.
+  const url = `https://api.edgegap.com/v2/deployments?tags=${encodeURIComponent(tag)}`;
+
+  const res = await fetch(url, { headers: edgegapHeaders() });
+  if (!res.ok) return null;
+
+  const json = await res.json().catch(() => null);
+  if (!json) return null;
+
+  // Common shapes:
+  // - { data: [ { request_id, status } ... ] }
+  // - { deployments: [ ... ] }
+  const list: any[] =
+    json.data ||
+    json.deployments ||
+    json.items ||
+    (Array.isArray(json) ? json : null);
+
+  if (!Array.isArray(list) || list.length === 0) return null;
+
+  // Pick the most recent-ish one:
+  const first = list[0];
+  const rid = first?.request_id || first?.id || first?.data?.request_id;
+  return rid ? String(rid) : null;
+}
+
 export async function POST(req: Request) {
   try {
     const app = process.env.EDGEGAP_APP;
@@ -58,33 +86,40 @@ export async function POST(req: Request) {
       );
     }
 
+    // 1) Always try reuse first (serverless safe).
+    const existing = await findExistingDeploymentRequestId(tag);
+    if (existing) {
+      // Ask status to see if it's ready and to provide host/port if possible.
+      const stRes = await fetch(`https://api.edgegap.com/v1/status/${existing}`, {
+        headers: edgegapHeaders(),
+      });
+
+      if (stRes.ok) {
+        const st = await stRes.json();
+        const conn = extractConn(st);
+
+        return Response.json({
+          reused: true,
+          request_id: existing,
+          status: getState(st),
+          ...(conn ? conn : {}),
+        });
+      }
+
+      // If status fails, still return request_id so client can try polling.
+      return Response.json({
+        reused: true,
+        request_id: existing,
+        status: "UNKNOWN",
+      });
+    }
+
+    // 2) No existing deployment found -> create new deployment.
     const body = await req.json().catch(() => ({} as any));
     const userIp =
       body?.ip ||
       req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
       null;
-
-    if (cachedRequestId) {
-      const stRes = await fetch(
-        `https://api.edgegap.com/v1/status/${cachedRequestId}`,
-        { headers: edgegapHeaders() }
-      );
-
-      if (stRes.ok) {
-        const st = await stRes.json();
-        const conn = extractConn(st);
-        if (conn) {
-          return Response.json({
-            reused: true,
-            request_id: cachedRequestId,
-            status: getState(st),
-            ...conn,
-          });
-        }
-      } else {
-        cachedRequestId = null;
-      }
-    }
 
     const deployBody: any = {
       application: app,
@@ -113,10 +148,10 @@ export async function POST(req: Request) {
     }
 
     const json = JSON.parse(text);
-    cachedRequestId =
+    const requestId =
       json.request_id || json.id || json.data?.request_id || null;
 
-    if (!cachedRequestId) {
+    if (!requestId) {
       return Response.json(
         { error: "Deploy response missing request_id" },
         { status: 500 }
@@ -125,7 +160,7 @@ export async function POST(req: Request) {
 
     return Response.json({
       reused: false,
-      request_id: cachedRequestId,
+      request_id: String(requestId),
       status: "DEPLOYING",
     });
   } catch (e: any) {
