@@ -36,9 +36,6 @@ function extractConn(st: any) {
   if (Array.isArray(ports) && ports.length) {
     external = ports[0]?.external || 0;
   } else if (ports && typeof ports === "object") {
-    // common shapes:
-    // ports: { game: { external: 12345 } }
-    // ports: { external: 12345 }
     external = ports?.[portName]?.external || ports?.external || 0;
   }
 
@@ -46,11 +43,23 @@ function extractConn(st: any) {
   return { host: String(fqdn), port: Number(external) };
 }
 
-// -----------------------------
-// Find existing active deployment (free plan -> max 1 active)
-// -----------------------------
+async function getStatusForRequestId(requestId: string) {
+  const stRes = await fetch(`https://api.edgegap.com/v1/status/${requestId}`, {
+    method: "GET",
+    headers: edgegapHeaders(),
+  });
+  if (!stRes.ok) return null;
+
+  const st = await stRes.json().catch(() => null);
+  if (!st) return null;
+
+  const conn = extractConn(st);
+  return { status: getState(st), ...(conn ? conn : {}) };
+}
+
+// ✅ Correct: list deployments is v1, not v2.
 async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
-  const res = await fetch("https://api.edgegap.com/v2/deployments", {
+  const res = await fetch("https://api.edgegap.com/v1/deployments", {
     method: "GET",
     headers: edgegapHeaders(),
   });
@@ -60,7 +69,10 @@ async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
   const json = await res.json().catch(() => null);
   if (!json) return null;
 
-  // Try a bunch of common shapes safely.
+  // Common shapes we might get back:
+  // - { data: [...] }
+  // - { deployments: [...] }
+  // - [ ... ]
   const list: any[] =
     json.data ||
     json.deployments ||
@@ -70,35 +82,35 @@ async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
 
   if (!Array.isArray(list) || list.length === 0) return null;
 
-  // Free plan => there should be only one active anyway.
-  const d = list[0];
+  // Prefer a deployment that is not terminated.
+  // Different schemas might name it differently, so we check a few fields.
+  for (const d of list) {
+    const rid =
+      d?.request_id ||
+      d?.id ||
+      d?.deployment_id ||
+      d?.data?.request_id ||
+      d?.deployment?.request_id;
 
-  const rid =
-    d?.request_id ||
-    d?.id ||
-    d?.data?.request_id ||
-    d?.deployment?.request_id ||
-    d?.deployment_id;
+    if (!rid) continue;
 
-  return rid ? String(rid) : null;
-}
+    const status =
+      d?.current_status ||
+      d?.status ||
+      d?.state ||
+      d?.deployment_status ||
+      "";
 
-async function getStatusForRequestId(requestId: string) {
-  const stRes = await fetch(`https://api.edgegap.com/v1/status/${requestId}`, {
-    method: "GET",
-    headers: edgegapHeaders(),
-  });
+    // If the list includes terminated entries, skip them.
+    if (typeof status === "string" && status.toUpperCase().includes("TERMINATED"))
+      continue;
 
-  if (!stRes.ok) return null;
+    return String(rid);
+  }
 
-  const st = await stRes.json().catch(() => null);
-  if (!st) return null;
-
-  const conn = extractConn(st);
-  return {
-    status: getState(st),
-    ...(conn ? conn : {}),
-  };
+  // If we couldn't filter, just return the first one with an id.
+  const first = list.find(d => d?.request_id || d?.id || d?.deployment_id);
+  return first ? String(first.request_id || first.id || first.deployment_id) : null;
 }
 
 export async function POST(req: Request) {
@@ -113,8 +125,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1) ALWAYS try to reuse any existing active deployment first.
-    // This prevents the free-plan 403 limit error.
+    // 1) Reuse existing deployment if any (free plan safe)
     const existingRid = await findAnyActiveDeploymentRequestId();
     if (existingRid) {
       const info = await getStatusForRequestId(existingRid);
@@ -126,7 +137,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // 2) None exists -> create a new deployment.
+    // 2) None exists -> create
     const tag = process.env.EDGEGAP_TAG || "boxer-free-singleton";
 
     const body = await req.json().catch(() => ({} as any));
@@ -155,8 +166,7 @@ export async function POST(req: Request) {
 
     const text = await depRes.text();
 
-    // If we race (two clients click at once), Edgegap may return the 403 limit.
-    // In that case, immediately reuse the now-existing deployment.
+    // 3) Race safety: if deploy got blocked (free-plan limit), reuse again
     if (!depRes.ok) {
       if (depRes.status === 403) {
         const rid2 = await findAnyActiveDeploymentRequestId();
@@ -178,14 +188,10 @@ export async function POST(req: Request) {
     }
 
     const json = JSON.parse(text);
-    const requestId =
-      json.request_id || json.id || json.data?.request_id || null;
+    const requestId = json.request_id || json.id || json.data?.request_id || null;
 
     if (!requestId) {
-      return Response.json(
-        { error: "Deploy response missing request_id" },
-        { status: 500 }
-      );
+      return Response.json({ error: "Deploy response missing request_id" }, { status: 500 });
     }
 
     return Response.json({
@@ -194,9 +200,6 @@ export async function POST(req: Request) {
       status: "DEPLOYING",
     });
   } catch (e: any) {
-    return Response.json(
-      { error: String(e?.message || e) },
-      { status: 500 }
-    );
+    return Response.json({ error: String(e?.message || e) }, { status: 500 });
   }
 }
