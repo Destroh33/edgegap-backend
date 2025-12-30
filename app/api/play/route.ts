@@ -1,5 +1,27 @@
 export const runtime = "nodejs";
 
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*", // tighten later (itch domain) if you want
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
+function json(data: any, init?: ResponseInit) {
+  return new Response(JSON.stringify(data), {
+    ...init,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+}
+
 function edgegapHeaders() {
   return {
     "Content-Type": "application/json",
@@ -30,13 +52,18 @@ function extractConn(st: any) {
     st?.deployment?.ports ||
     st?.data?.deployment?.ports;
 
-  const portName = process.env.EDGEGAP_PORT_NAME || "game";
+  // Your Edgegap UI shows the port name as "gameport".
+  const portName = process.env.EDGEGAP_PORT_NAME || "gameport";
   let external = 0;
 
   if (Array.isArray(ports) && ports.length) {
-    external = ports[0]?.external || 0;
+    const byName = ports.find(
+      (p: any) => p?.name === portName || p?.port_name === portName
+    );
+    external = (byName?.external || ports[0]?.external || 0) as number;
   } else if (ports && typeof ports === "object") {
-    external = ports?.[portName]?.external || ports?.external || 0;
+    external =
+      ports?.[portName]?.external || ports?.external || (0 as number);
   }
 
   if (!fqdn || !external) return null;
@@ -57,7 +84,6 @@ async function getStatusForRequestId(requestId: string) {
   return { status: getState(st), ...(conn ? conn : {}) };
 }
 
-// ✅ Correct: list deployments is v1, not v2.
 async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
   const res = await fetch("https://api.edgegap.com/v1/deployments", {
     method: "GET",
@@ -69,10 +95,6 @@ async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
   const json = await res.json().catch(() => null);
   if (!json) return null;
 
-  // Common shapes we might get back:
-  // - { data: [...] }
-  // - { deployments: [...] }
-  // - [ ... ]
   const list: any[] =
     json.data ||
     json.deployments ||
@@ -82,8 +104,6 @@ async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
 
   if (!Array.isArray(list) || list.length === 0) return null;
 
-  // Prefer a deployment that is not terminated.
-  // Different schemas might name it differently, so we check a few fields.
   for (const d of list) {
     const rid =
       d?.request_id ||
@@ -101,15 +121,16 @@ async function findAnyActiveDeploymentRequestId(): Promise<string | null> {
       d?.deployment_status ||
       "";
 
-    // If the list includes terminated entries, skip them.
-    if (typeof status === "string" && status.toUpperCase().includes("TERMINATED"))
+    if (
+      typeof status === "string" &&
+      status.toUpperCase().includes("TERMINATED")
+    )
       continue;
 
     return String(rid);
   }
 
-  // If we couldn't filter, just return the first one with an id.
-  const first = list.find(d => d?.request_id || d?.id || d?.deployment_id);
+  const first = list.find((d) => d?.request_id || d?.id || d?.deployment_id);
   return first ? String(first.request_id || first.id || first.deployment_id) : null;
 }
 
@@ -119,7 +140,7 @@ export async function POST(req: Request) {
     const ver = process.env.EDGEGAP_VER;
 
     if (!process.env.EDGEGAP_TOKEN || !app || !ver) {
-      return Response.json(
+      return json(
         { error: "Missing EDGEGAP_TOKEN/EDGEGAP_APP/EDGEGAP_VER env vars" },
         { status: 500 }
       );
@@ -129,12 +150,15 @@ export async function POST(req: Request) {
     const existingRid = await findAnyActiveDeploymentRequestId();
     if (existingRid) {
       const info = await getStatusForRequestId(existingRid);
-      return Response.json({
-        reused: true,
-        request_id: existingRid,
-        status: info?.status ?? "UNKNOWN",
-        ...(info?.host && info?.port ? { host: info.host, port: info.port } : {}),
-      });
+      return json(
+        {
+          reused: true,
+          request_id: existingRid,
+          status: info?.status ?? "UNKNOWN",
+          ...(info?.host && info?.port ? { host: info.host, port: info.port } : {}),
+        },
+        { status: 200 }
+      );
     }
 
     // 2) None exists -> create
@@ -172,34 +196,41 @@ export async function POST(req: Request) {
         const rid2 = await findAnyActiveDeploymentRequestId();
         if (rid2) {
           const info2 = await getStatusForRequestId(rid2);
-          return Response.json({
-            reused: true,
-            request_id: rid2,
-            status: info2?.status ?? "UNKNOWN",
-            ...(info2?.host && info2?.port ? { host: info2.host, port: info2.port } : {}),
-          });
+          return json(
+            {
+              reused: true,
+              request_id: rid2,
+              status: info2?.status ?? "UNKNOWN",
+              ...(info2?.host && info2?.port ? { host: info2.host, port: info2.port } : {}),
+            },
+            { status: 200 }
+          );
         }
       }
 
-      return Response.json(
+      return json(
         { error: `Deploy failed ${depRes.status}: ${text}` },
         { status: 500 }
       );
     }
 
-    const json = JSON.parse(text);
-    const requestId = json.request_id || json.id || json.data?.request_id || null;
+    const parsed = JSON.parse(text);
+    const requestId =
+      parsed.request_id || parsed.id || parsed.data?.request_id || null;
 
     if (!requestId) {
-      return Response.json({ error: "Deploy response missing request_id" }, { status: 500 });
+      return json({ error: "Deploy response missing request_id" }, { status: 500 });
     }
 
-    return Response.json({
-      reused: false,
-      request_id: String(requestId),
-      status: "DEPLOYING",
-    });
+    return json(
+      {
+        reused: false,
+        request_id: String(requestId),
+        status: "DEPLOYING",
+      },
+      { status: 200 }
+    );
   } catch (e: any) {
-    return Response.json({ error: String(e?.message || e) }, { status: 500 });
+    return json({ error: String(e?.message || e) }, { status: 500 });
   }
 }

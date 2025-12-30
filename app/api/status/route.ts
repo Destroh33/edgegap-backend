@@ -1,5 +1,27 @@
 export const runtime = "nodejs";
 
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
+function json(data: any, init?: ResponseInit) {
+  return new Response(JSON.stringify(data), {
+    ...init,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+}
+
 function edgegapHeaders() {
   return {
     "Content-Type": "application/json",
@@ -30,13 +52,17 @@ function extractConn(st: any) {
     st?.deployment?.ports ||
     st?.data?.deployment?.ports;
 
-  const portName = process.env.EDGEGAP_PORT_NAME || "game";
+  const portName = process.env.EDGEGAP_PORT_NAME || "gameport";
   let external = 0;
 
   if (Array.isArray(ports) && ports.length) {
-    external = ports[0]?.external || 0;
+    const byName = ports.find(
+      (p: any) => p?.name === portName || p?.port_name === portName
+    );
+    external = (byName?.external || ports[0]?.external || 0) as number;
   } else if (ports && typeof ports === "object") {
-    external = ports?.[portName]?.external || ports?.external || 0;
+    external =
+      ports?.[portName]?.external || ports?.external || (0 as number);
   }
 
   if (!fqdn || !external) return null;
@@ -46,16 +72,13 @@ function extractConn(st: any) {
 export async function GET(req: Request) {
   try {
     if (!process.env.EDGEGAP_TOKEN) {
-      return Response.json(
-        { error: "Missing EDGEGAP_TOKEN env var" },
-        { status: 500 }
-      );
+      return json({ error: "Missing EDGEGAP_TOKEN env var" }, { status: 500 });
     }
 
     const { searchParams } = new URL(req.url);
     const requestId = searchParams.get("request_id");
     if (!requestId) {
-      return Response.json({ error: "Missing request_id" }, { status: 400 });
+      return json({ error: "Missing request_id" }, { status: 400 });
     }
 
     const stRes = await fetch(`https://api.edgegap.com/v1/status/${requestId}`, {
@@ -65,7 +88,7 @@ export async function GET(req: Request) {
 
     const text = await stRes.text();
     if (!stRes.ok) {
-      return Response.json(
+      return json(
         { error: `Status failed ${stRes.status}: ${text}` },
         { status: 500 }
       );
@@ -75,15 +98,15 @@ export async function GET(req: Request) {
     const status = getState(st);
     const conn = extractConn(st);
 
-    return Response.json({
-      request_id: requestId,
-      status,
-      ...(conn ? conn : {}),
-    });
-  } catch (e: any) {
-    return Response.json(
-      { error: String(e?.message || e) },
-      { status: 500 }
+    return json(
+      {
+        request_id: requestId,
+        status,
+        ...(conn ? conn : {}),
+      },
+      { status: 200 }
     );
+  } catch (e: any) {
+    return json({ error: String(e?.message || e) }, { status: 500 });
   }
 }
